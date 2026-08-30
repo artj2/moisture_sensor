@@ -34,10 +34,15 @@
 
 // Wake interval as a function of measured moisture. Wetter soil changes slowly,
 // so it is checked less often.
-#define SLEEP_SECS_WET     180   // moisture > 70%
-#define SLEEP_SECS_MID     120   // moisture > 50%
-#define SLEEP_SECS_DRY      60   // moisture <= 50%
-#define SLEEP_SECS_ERROR    60   // sensor read failed
+// #define SLEEP_SECS_WET   (4 * 60 * 60)   // moisture > 70%  || 4 hours
+// #define SLEEP_SECS_MID   (2 * 60 * 60)   // moisture > 50%  || 2 hours
+// #define SLEEP_SECS_DRY   (30 * 60)       // moisture <= 50% || 30 minutes
+// #define SLEEP_SECS_ERROR (30 * 60)       // sensor read failed
+
+#define SLEEP_SECS_WET   (30 * 60)   // moisture > 70%  || 30 minutes
+#define SLEEP_SECS_MID   (20 * 60)   // moisture > 50%  || 20 minutes
+#define SLEEP_SECS_DRY   (10 * 60)   // moisture <= 50% || 10 minutes
+#define SLEEP_SECS_ERROR (10 * 60)   // sensor read failed
 
 // How long to wait for Thread to attach after a wake before giving up.
 #define THREAD_ATTACH_TIMEOUT_MS 30000
@@ -45,6 +50,11 @@
 // Time to stay awake after publishing, so the report and its ack get out
 // before the radio is cut. Tune this once you can see report timing in the log.
 #define REPORT_SETTLE_MS 3000
+
+// Longer grace period for the first cycle after commissioning. The controller
+// walks the descriptor tree and sets up subscriptions immediately after pairing,
+// and sleeping through that leaves Home Assistant with an incomplete device.
+#define COMMISSION_SETTLE_MS 30000
 
 // ---------------------------------------------------------------------------
 
@@ -249,19 +259,29 @@ static void measure_and_sleep_task(void *pvParameters)
 
     // Never sleep while uncommissioned, or the commissioning window would close
     // every time and the device could never be added to Home Assistant.
+    bool just_commissioned = false;
     if (!is_commissioned()) {
         ESP_LOGW(TAG, "Not commissioned - staying awake for commissioning");
         while (!is_commissioned()) {
             vTaskDelay(pdMS_TO_TICKS(5000));
         }
+        just_commissioned = true;
         ESP_LOGI(TAG, "Now commissioned - entering sleep cycle");
+
+        // The reading above was taken before pairing and may be old by now.
+        moisture_percent = read_moisture_percent(&adc_raw);
+        ESP_LOGI(TAG, "Post-commissioning reading - Raw ADC: %d, Moisture: %.1f%%",
+                 adc_raw, moisture_percent);
     }
 
     if (wait_for_thread_attached(THREAD_ATTACH_TIMEOUT_MS) && moisture_percent >= 0.0f) {
         uint16_t matter_humidity = (uint16_t)(moisture_percent * 100.0f);
         if (publish_humidity(matter_humidity) == ESP_OK) {
-            // Let the subscription report actually go out.
-            vTaskDelay(pdMS_TO_TICKS(REPORT_SETTLE_MS));
+            // Let the subscription report actually go out. After commissioning,
+            // also give the controller time to finish interrogating the device.
+            uint32_t settle_ms = just_commissioned ? COMMISSION_SETTLE_MS : REPORT_SETTLE_MS;
+            ESP_LOGI(TAG, "Staying awake %" PRIu32 " ms before sleep", settle_ms);
+            vTaskDelay(pdMS_TO_TICKS(settle_ms));
         }
     }
 
