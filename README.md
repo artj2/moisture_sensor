@@ -33,7 +33,7 @@ Configured in [`main/app_main.cpp`](main/app_main.cpp):
 
 ### Dynamic Matter Report Completion & Self-Healing Retries
 - **Event/State-Driven Sleep Gate (`wait_for_matter_report_complete`):** Instead of a fixed post-publish delay, the sensor polls `InteractionModelEngine` and `ExchangeManager` after Thread attach—keeping ICD in `500 ms` Active Mode during mDNS/SRP lookup, waiting until an active `Subscribe` `ReadHandler` is registered, and requiring **`1.5 s` of uninterrupted zero in-flight `ReportData` chunks and zero open Matter exchanges** (up to a `60 s` ceiling) before calling `esp_deep_sleep_start()`. Normal wakes finish in **~12.5–14 s**, while wakes experiencing 802.15.4 retransmissions or subscription renewals stay awake until every `StatusResponse (0x00)` and `StandaloneAck` completes.
-- **Exponential Retry Backoff:** If Thread fails to attach within `60 s` or the Matter report does not complete cleanly, the reading is marked unpublished and retried with capped exponential backoff (`30 min → 1 h → 2 h → 4 h → 6 h`) via `SLEEP_SECS_RETRY` / `SLEEP_SECS_RETRY_MAX` rather than sleeping for the full `6h`/`12h` interval.
+- **Exponential Retry Backoff:** If Thread fails to attach within `25 s` or the Matter report does not complete cleanly, the reading is marked unpublished and retried with capped exponential backoff (`30 min → 1 h → 2 h → 4 h → 6 h`) via `SLEEP_SECS_RETRY` / `SLEEP_SECS_RETRY_MAX` rather than sleeping for the full `6h`/`12h` interval.
 - **Test / Monitoring Toggles:**
   - `TEST_SHORT_SLEEP` (`0` in production): set to `1` for `2-minute` test cycles.
   - `MONITORING_MAX_6H` (`0` in production): set to `1` for `2h / 4h / 6h` capped monitoring intervals.

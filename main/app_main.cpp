@@ -79,7 +79,10 @@
 #define SLEEP_SECS_RETRY_MAX (6 * 60 * 60)
 
 // How long to wait for Thread to attach after a wake before giving up.
-#define THREAD_ATTACH_TIMEOUT_MS 60000
+// OpenThread's first 4 MLE attach attempts complete within ~1-22 s; cutting off
+// at 25 s avoids burning active radio power through the 8s/16s/32s backoff tail
+// when the Border Router is unreachable.
+#define THREAD_ATTACH_TIMEOUT_MS 25000
 
 // Dynamic Matter report completion limits after Thread attach:
 // - Wait up to SUBSCRIPTION_WAIT_MS for subscription resumption (or controller
