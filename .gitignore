@@ -3,3 +3,4 @@ managed_components/
 scratch/
 scratch_matter/
 sdkconfig.*
+!sdkconfig.defaults

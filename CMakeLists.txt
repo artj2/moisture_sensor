@@ -6,6 +6,10 @@ if(NOT DEFINED ENV{ESP_MATTER_PATH})
     message(FATAL_ERROR "Please set ESP_MATTER_PATH to the path of esp-matter repo")
 endif(NOT DEFINED ENV{ESP_MATTER_PATH})
 
+if(NOT DEFINED IDF_TARGET)
+    set(IDF_TARGET "esp32c6")
+endif()
+
 if(NOT DEFINED ENV{ESP_MATTER_DEVICE_PATH})
     if("${IDF_TARGET}" STREQUAL "esp32" OR "${IDF_TARGET}" STREQUAL "")
         set(ENV{ESP_MATTER_DEVICE_PATH} $ENV{ESP_MATTER_PATH}/device_hal/device/esp32_devkit_c)
