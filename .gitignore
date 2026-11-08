@@ -4,3 +4,4 @@ scratch/
 scratch_matter/
 sdkconfig.*
 !sdkconfig.defaults
+TODO.md
