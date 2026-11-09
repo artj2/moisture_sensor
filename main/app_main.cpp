@@ -56,15 +56,16 @@ static_assert(sizeof(DEVICE_HARDWARE_VER_STR) - 1 <= 64, "HardwareVersionString 
 #define SENSOR_SETTLE_MS   250
 #define SENSOR_ADC_SAMPLES 16
 
-// Calibration values in air (dry) and water (wet) at 12 dB ADC attenuation.
-// When ADC_DRY_MV / ADC_WET_MV are 0, hardware_init() derives the calibrated
-// millivolt endpoints from ADC_DRY_VAL / ADC_WET_VAL through this chip's factory
-// eFuse curve-fitting calibration and logs the exact mV values on boot so they
-// can optionally be locked in for cross-board portability.
-#define ADC_DRY_MV  0
-#define ADC_WET_MV  0
-#define ADC_DRY_VAL 2572.0f
-#define ADC_WET_VAL 886.0f
+// Sensor calibration endpoints (12 dB ADC attenuation):
+// - Dry (0% moisture):   probe held dry in the air
+// - Wet (100% moisture): probe submerged in water
+// ADC_DRY_MV / ADC_WET_MV are factory eFuse-calibrated millivolt values portable
+// across ESP32-C6 boards; ADC_DRY_VAL / ADC_WET_VAL are the corresponding raw
+// 12-bit fallback counts (also used to derive mV on-chip if *_MV are set to 0).
+#define ADC_DRY_MV  2553    // dry in the air (mV)
+#define ADC_WET_MV  881     // submerged in water (mV)
+#define ADC_DRY_VAL 2572.0f // dry in the air (raw 12-bit fallback)
+#define ADC_WET_VAL 886.0f  // submerged in water (raw 12-bit fallback)
 
 // ---------------------------------------------------------------------------
 // Sleep policy
