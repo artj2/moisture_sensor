@@ -4,6 +4,8 @@
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "nvs_flash.h"
@@ -42,7 +44,13 @@
 #define SENSOR_SETTLE_MS   250
 #define SENSOR_ADC_SAMPLES 16
 
-// Calibration values; in the air and in water(raw ADC at 12 dB attenuation)
+// Calibration values in air (dry) and water (wet) at 12 dB ADC attenuation.
+// When ADC_DRY_MV / ADC_WET_MV are 0, hardware_init() derives the calibrated
+// millivolt endpoints from ADC_DRY_VAL / ADC_WET_VAL through this chip's factory
+// eFuse curve-fitting calibration and logs the exact mV values on boot so they
+// can optionally be locked in for cross-board portability.
+#define ADC_DRY_MV  0
+#define ADC_WET_MV  0
 #define ADC_DRY_VAL 2572.0f
 #define ADC_WET_VAL 886.0f
 
@@ -112,8 +120,12 @@ using namespace chip::app::Clusters;
 static const char *TAG = "THREAD_MOISTURE";
 static uint16_t humidity_endpoint_id = 0;
 static adc_oneshot_unit_handle_t adc1_handle = NULL;
+static adc_cali_handle_t adc1_cali_handle = NULL;
+static int s_cal_dry_mv = 0;
+static int s_cal_wet_mv = 0;
 static float initial_moisture_percent = -1.0f;
 static int initial_adc_raw = 0;
+static int initial_adc_mv = -1;
 static volatile bool s_commissioning_complete = false;
 
 // Survives deep sleep; cleared on power-on and hard reset.
@@ -227,7 +239,7 @@ static void app_event_cb(const chip::DeviceLayer::ChipDeviceEvent *event, intptr
 // Sensor
 // ---------------------------------------------------------------------------
 
-static float read_moisture_percent(int *raw_out)
+static float read_moisture_percent(int *raw_out, int *mv_out)
 {
     // Power up with full GPIO drive strength, let the sensor's onboard LDO,
     // 555 oscillator, and RC filter settle, multisample, then power down.
@@ -238,15 +250,24 @@ static float read_moisture_percent(int *raw_out)
     int dummy = 0;
     (void)adc_oneshot_read(adc1_handle, SENSOR_ADC_CHAN, &dummy);
 
-    int64_t sum = 0;
+    int64_t raw_sum = 0;
+    int64_t mv_sum = 0;
     int valid_samples = 0;
+    int valid_mv_samples = 0;
     esp_err_t last_err = ESP_OK;
     for (int i = 0; i < SENSOR_ADC_SAMPLES; i++) {
         int sample = 0;
         esp_err_t err = adc_oneshot_read(adc1_handle, SENSOR_ADC_CHAN, &sample);
         if (err == ESP_OK) {
-            sum += sample;
+            raw_sum += sample;
             valid_samples++;
+            if (adc1_cali_handle != NULL) {
+                int sample_mv = 0;
+                if (adc_cali_raw_to_voltage(adc1_cali_handle, sample, &sample_mv) == ESP_OK) {
+                    mv_sum += sample_mv;
+                    valid_mv_samples++;
+                }
+            }
         } else {
             last_err = err;
         }
@@ -256,15 +277,42 @@ static float read_moisture_percent(int *raw_out)
     gpio_set_level(SENSOR_POWER_PIN, 0);
 
     if (valid_samples == 0) {
+        if (raw_out) {
+            *raw_out = 0;
+        }
+        if (mv_out) {
+            *mv_out = -1;
+        }
         ESP_LOGE(TAG, "ADC read failed: %s", esp_err_to_name(last_err));
         return -1.0f;
     }
 
-    int adc_raw = static_cast<int>((sum + (valid_samples / 2)) / valid_samples);
+    int adc_raw = static_cast<int>((raw_sum + (valid_samples / 2)) / valid_samples);
     if (raw_out) {
         *raw_out = adc_raw;
     }
 
+    if (valid_mv_samples > 0 && s_cal_dry_mv > s_cal_wet_mv) {
+        int adc_mv = static_cast<int>((mv_sum + (valid_mv_samples / 2)) / valid_mv_samples);
+        if (mv_out) {
+            *mv_out = adc_mv;
+        }
+        // Capacitive sensors read HIGH voltage when dry, LOW voltage when wet.
+        if (adc_mv >= s_cal_dry_mv) {
+            return 0.0f;
+        }
+        if (adc_mv <= s_cal_wet_mv) {
+            return 100.0f;
+        }
+        return 100.0f * static_cast<float>(s_cal_dry_mv - adc_mv) /
+               static_cast<float>(s_cal_dry_mv - s_cal_wet_mv);
+    }
+
+    if (mv_out) {
+        *mv_out = -1;
+    }
+
+    // Fallback to raw counts if factory eFuse calibration is unavailable.
     // Capacitive sensors read HIGH when dry, LOW when wet, so the mapping is inverted.
     if (adc_raw >= (int)ADC_DRY_VAL) {
         return 0.0f;
@@ -475,6 +523,10 @@ static void enter_deep_sleep(uint32_t seconds)
 
     ESP_LOGI(TAG, "Sleeping for %" PRIu32 " s", seconds);
 
+    if (adc1_cali_handle) {
+        adc_cali_delete_scheme_curve_fitting(adc1_cali_handle);
+        adc1_cali_handle = NULL;
+    }
     if (adc1_handle) {
         adc_oneshot_del_unit(adc1_handle);
         adc1_handle = NULL;
@@ -501,9 +553,15 @@ static void enter_deep_sleep(uint32_t seconds)
 static void measure_and_sleep_task(void *pvParameters)
 {
     int adc_raw = initial_adc_raw;
+    int adc_mv = initial_adc_mv;
     float moisture_percent = initial_moisture_percent;
-    ESP_LOGI(TAG, "Wake #%" PRIu32 " - Raw ADC: %d, Moisture: %.1f%%",
-              wake_count, adc_raw, moisture_percent);
+    if (adc_mv >= 0) {
+        ESP_LOGI(TAG, "Wake #%" PRIu32 " - Raw ADC: %d (%d mV), Moisture: %.1f%%",
+                 wake_count, adc_raw, adc_mv, moisture_percent);
+    } else {
+        ESP_LOGI(TAG, "Wake #%" PRIu32 " - Raw ADC: %d, Moisture: %.1f%%",
+                 wake_count, adc_raw, moisture_percent);
+    }
 
     if (is_commissioned()) {
         s_commissioning_complete = true;
@@ -532,9 +590,14 @@ static void measure_and_sleep_task(void *pvParameters)
             ESP_LOGI(TAG, "Now commissioned - entering sleep cycle");
 
             // The reading above was taken before pairing and may be old by now.
-            moisture_percent = read_moisture_percent(&adc_raw);
-            ESP_LOGI(TAG, "Post-commissioning reading - Raw ADC: %d, Moisture: %.1f%%",
-                     adc_raw, moisture_percent);
+            moisture_percent = read_moisture_percent(&adc_raw, &adc_mv);
+            if (adc_mv >= 0) {
+                ESP_LOGI(TAG, "Post-commissioning reading - Raw ADC: %d (%d mV), Moisture: %.1f%%",
+                         adc_raw, adc_mv, moisture_percent);
+            } else {
+                ESP_LOGI(TAG, "Post-commissioning reading - Raw ADC: %d, Moisture: %.1f%%",
+                         adc_raw, moisture_percent);
+            }
         }
 
         log_active_thread_dataset(pdMS_TO_TICKS(100));
@@ -636,6 +699,45 @@ static void hardware_init(void)
     chan_config.bitwidth = ADC_BITWIDTH_DEFAULT;
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, SENSOR_ADC_CHAN, &chan_config));
 
+    adc_cali_curve_fitting_config_t cali_config = {
+        .unit_id = ADC_UNIT_1,
+        .chan = SENSOR_ADC_CHAN,
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    esp_err_t cali_err = adc_cali_create_scheme_curve_fitting(&cali_config, &adc1_cali_handle);
+    if (cali_err == ESP_OK) {
+        int dry_mv = ADC_DRY_MV;
+        int wet_mv = ADC_WET_MV;
+        if (dry_mv <= 0 || wet_mv <= 0) {
+            esp_err_t e1 = adc_cali_raw_to_voltage(
+                adc1_cali_handle, static_cast<int>(lroundf(ADC_DRY_VAL)), &dry_mv);
+            esp_err_t e2 = adc_cali_raw_to_voltage(
+                adc1_cali_handle, static_cast<int>(lroundf(ADC_WET_VAL)), &wet_mv);
+            if (e1 != ESP_OK || e2 != ESP_OK) {
+                dry_mv = 0;
+                wet_mv = 0;
+            }
+        }
+        if (dry_mv > wet_mv && wet_mv > 0) {
+            s_cal_dry_mv = dry_mv;
+            s_cal_wet_mv = wet_mv;
+            ESP_LOGI(TAG,
+                     "ADC eFuse curve-fitting calibration active: dry=%d mV (raw %.0f), wet=%d mV (raw %.0f)",
+                     s_cal_dry_mv, ADC_DRY_VAL, s_cal_wet_mv, ADC_WET_VAL);
+        } else {
+            ESP_LOGW(TAG,
+                     "Invalid calibrated mV endpoints (dry=%d, wet=%d) - falling back to raw ADC counts",
+                     dry_mv, wet_mv);
+            adc_cali_delete_scheme_curve_fitting(adc1_cali_handle);
+            adc1_cali_handle = NULL;
+        }
+    } else {
+        adc1_cali_handle = NULL;
+        ESP_LOGW(TAG, "ADC eFuse calibration unavailable (%s) - falling back to raw ADC counts",
+                 esp_err_to_name(cali_err));
+    }
+
     button_init();
 }
 
@@ -674,7 +776,7 @@ extern "C" void app_main(void)
 
     // Read the sensor before creating the Matter endpoint so MeasuredValue starts
     // with the actual moisture reading rather than 0% during subscription resumption.
-    initial_moisture_percent = read_moisture_percent(&initial_adc_raw);
+    initial_moisture_percent = read_moisture_percent(&initial_adc_raw, &initial_adc_mv);
     uint16_t initial_centi = (initial_moisture_percent >= 0.0f)
                                  ? percent_to_centi(initial_moisture_percent)
                                  : 0;
