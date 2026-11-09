@@ -8,8 +8,8 @@ Low-power capacitive soil moisture sensor built on the **ESP32-C6** using **ESP-
 
 | Component / Signal | ESP32-C6 Pin | Notes |
 | :--- | :--- | :--- |
-| **MCU Board** | Waveshare / The Pi Hut ESP32-C6 Mini | `ESP32-C6FH8`, native USB-Serial/JTAG (`/dev/ttyACM0`) |
-| **Sensor `VCC`** | `GPIO1` (`SENSOR_POWER_PIN`) | Driven HIGH (`GPIO_DRIVE_CAP_3`) for `250 ms` + 16 ADC samples per wake, held LOW in deep sleep to prevent probe electrolysis and save power |
+| **MCU Board** | Waveshare ESP32-C6-Zero | `ESP32-C6FH8`, native USB-Serial/JTAG (`/dev/ttyACM0`) |
+| **Sensor `VCC`** | `GPIO1` (`SENSOR_POWER_PIN`) | Capacitive Soil Moisture Sensor v2.0 — driven HIGH (`GPIO_DRIVE_CAP_3`) for `250 ms` + 16 ADC samples per wake, held LOW in deep sleep to prevent probe electrolysis and save power |
 | **Sensor `AOUT`** | `GPIO2` (`ADC1_CH2`) | 12 dB ADC attenuation with ESP32-C6 factory eFuse curve-fitting millivolt calibration (`ADC_DRY_MV` / `ADC_WET_MV`, derived on-chip from `ADC_DRY_VAL = 2572.0f` / `ADC_WET_VAL = 886.0f` if unset) |
 | **Sensor `GND`** | `GND` | Common ground |
 | **Onboard `WS2812B` LED** | `GPIO8` (`WS2812_DATA_PIN`) | Data line held LOW in deep sleep (**disconnect/desolder LED on battery power** — see below) |
@@ -57,7 +57,7 @@ idf.py build
 python -m esptool --chip esp32c6 -p /dev/ttyACM0 -b 460800 \
   --before default-reset --after hard-reset write-flash \
   --flash-mode dio --flash-freq 80m --flash-size 4MB \
-  0x20000 build/light.bin
+  0x20000 build/moisture_sensor.bin
 ```
 
 ### 3. Full Initial Flash (New Board)

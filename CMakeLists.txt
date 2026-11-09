@@ -67,12 +67,12 @@ set(EXTRA_COMPONENT_DIRS
     "${ESP_MATTER_PATH}/device_hal/device"
     ${extra_components_dirs_append})
 
-project(light)
+project(moisture_sensor)
 
 # WARNING: This is just an example for using key for decrypting the encrypted OTA image
 # Please do not use it as is.
 if(CONFIG_ENABLE_ENCRYPTED_OTA)
-    target_add_binary_data(light.elf "esp_image_encryption_key.pem" TEXT)
+    target_add_binary_data(moisture_sensor.elf "esp_image_encryption_key.pem" TEXT)
 endif()
 
 if(CONFIG_IDF_TARGET_ESP32C2)

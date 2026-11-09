@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -16,6 +17,7 @@
 #include <openthread/dataset.h>
 #include <platform/ESP32/OpenthreadLauncher.h>
 #include "esp_matter.h"
+#include "esp_matter_providers.h"
 #include <iot_button.h>
 #include <button_gpio.h>
 #include <app_reset.h>
@@ -27,6 +29,7 @@
 #include <app-common/zap-generated/attributes/Accessors.h>
 #include <platform/PlatformManager.h>
 #include <platform/ConnectivityManager.h>
+#include <platform/DeviceInstanceInfoProvider.h>
 #include <setup_payload/OnboardingCodesUtil.h>
 #include <app/clusters/relative-humidity-measurement-server/RelativeHumidityMeasurementCluster.h>
 #include <app/clusters/relative-humidity-measurement-server/CodegenIntegration.h>
@@ -39,6 +42,15 @@
 #define SENSOR_ADC_CHAN  ADC_CHANNEL_2 // GPIO2 is ADC1 Channel 2 on ESP32-C6
 #define WS2812_DATA_PIN  GPIO_NUM_8    // Onboard WS2812B RGB LED data line
 #define BOOT_BUTTON_PIN  GPIO_NUM_9    // Onboard BOOT button (hold 5s for factory reset)
+
+// Matter BasicInformation device metadata shown in Home Assistant Device Info
+#define DEVICE_VENDOR_NAME_STR  "Artur"
+#define DEVICE_PRODUCT_NAME_STR "Plant Soil Sensor"
+#define DEVICE_HARDWARE_VER_STR "ESP32-C6-Zero & Capacitive Soil Moisture Sensor v2.0"
+
+static_assert(sizeof(DEVICE_VENDOR_NAME_STR) - 1 <= 32, "VendorName exceeds Matter 32-char limit");
+static_assert(sizeof(DEVICE_PRODUCT_NAME_STR) - 1 <= 32, "ProductName exceeds Matter 32-char limit");
+static_assert(sizeof(DEVICE_HARDWARE_VER_STR) - 1 <= 64, "HardwareVersionString exceeds Matter 64-char limit");
 
 // Capacitive sensor power-on RC stabilization and multisampling
 #define SENSOR_SETTLE_MS   250
@@ -144,6 +156,73 @@ private:
     ScopedStackLock(const ScopedStackLock &) = delete;
     ScopedStackLock &operator=(const ScopedStackLock &) = delete;
 };
+
+class PlantSoilSensorInfoProvider : public chip::DeviceLayer::DeviceInstanceInfoProvider {
+public:
+    CHIP_ERROR GetVendorName(char *buf, size_t bufSize) override
+    {
+        return CopyString(DEVICE_VENDOR_NAME_STR, sizeof(DEVICE_VENDOR_NAME_STR), buf, bufSize);
+    }
+    CHIP_ERROR GetVendorId(uint16_t &vendorId) override
+    {
+        vendorId = static_cast<uint16_t>(CONFIG_DEVICE_VENDOR_ID);
+        return CHIP_NO_ERROR;
+    }
+    CHIP_ERROR GetProductName(char *buf, size_t bufSize) override
+    {
+        return CopyString(DEVICE_PRODUCT_NAME_STR, sizeof(DEVICE_PRODUCT_NAME_STR), buf, bufSize);
+    }
+    CHIP_ERROR GetProductId(uint16_t &productId) override
+    {
+        productId = static_cast<uint16_t>(CONFIG_DEVICE_PRODUCT_ID);
+        return CHIP_NO_ERROR;
+    }
+    CHIP_ERROR GetPartNumber(char *buf, size_t bufSize) override
+    {
+        return CHIP_ERROR_UNSUPPORTED_CHIP_FEATURE;
+    }
+    CHIP_ERROR GetProductURL(char *buf, size_t bufSize) override
+    {
+        return CHIP_ERROR_UNSUPPORTED_CHIP_FEATURE;
+    }
+    CHIP_ERROR GetProductLabel(char *buf, size_t bufSize) override
+    {
+        return CHIP_ERROR_UNSUPPORTED_CHIP_FEATURE;
+    }
+    CHIP_ERROR GetSerialNumber(char *buf, size_t bufSize) override
+    {
+        return CHIP_ERROR_UNSUPPORTED_CHIP_FEATURE;
+    }
+    CHIP_ERROR GetManufacturingDate(uint16_t &year, uint8_t &month, uint8_t &day) override
+    {
+        return CHIP_ERROR_UNSUPPORTED_CHIP_FEATURE;
+    }
+    CHIP_ERROR GetHardwareVersion(uint16_t &hardwareVersion) override
+    {
+        hardwareVersion = static_cast<uint16_t>(CONFIG_DEFAULT_DEVICE_HARDWARE_VERSION);
+        return CHIP_NO_ERROR;
+    }
+    CHIP_ERROR GetHardwareVersionString(char *buf, size_t bufSize) override
+    {
+        return CopyString(DEVICE_HARDWARE_VER_STR, sizeof(DEVICE_HARDWARE_VER_STR), buf, bufSize);
+    }
+    CHIP_ERROR GetRotatingDeviceIdUniqueId(chip::MutableByteSpan &uniqueIdSpan) override
+    {
+        return CHIP_ERROR_UNSUPPORTED_CHIP_FEATURE;
+    }
+
+private:
+    static CHIP_ERROR CopyString(const char *src, size_t srcSizeWithNull, char *buf, size_t bufSize)
+    {
+        if (!buf || bufSize < srcSizeWithNull) {
+            return CHIP_ERROR_BUFFER_TOO_SMALL;
+        }
+        memcpy(buf, src, srcSizeWithNull);
+        return CHIP_NO_ERROR;
+    }
+};
+
+static PlantSoilSensorInfoProvider s_device_instance_info_provider;
 
 static uint16_t percent_to_centi(float moisture_percent)
 {
@@ -783,6 +862,9 @@ extern "C" void app_main(void)
 
     // 5. Matter node
     node::config_t node_config;
+    snprintf(node_config.root_node.basic_information.node_label,
+             sizeof(node_config.root_node.basic_information.node_label),
+             "%s", DEVICE_PRODUCT_NAME_STR);
     node_t *node = node::create(&node_config, app_attribute_update_cb, app_identification_cb);
     if (!node) {
         ESP_LOGE(TAG, "Failed to create Matter node");
@@ -807,7 +889,8 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Humidity sensor endpoint created, id = %d (initial = %u centi-%%)",
              humidity_endpoint_id, initial_centi);
 
-    // 7. Start the Matter stack
+    // 7. Register custom Matter device metadata and start the Matter stack
+    esp_matter::set_custom_device_instance_info_provider(&s_device_instance_info_provider);
     err = esp_matter::start(app_event_cb);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start Matter: %s", esp_err_to_name(err));
