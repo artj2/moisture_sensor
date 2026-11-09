@@ -20,15 +20,19 @@ Even with `GPIO8` held LOW in deep sleep, the onboard `WS2812B` smart RGB LED's 
 
 ---
 
-## Adaptive Sleep & Reliable Delivery Policy
+## Soil Scale & Adaptive Sleep Policy
 
 Configured in [`main/app_main.cpp`](main/app_main.cpp):
 
-| Soil Moisture | Tier | Deep-Sleep Interval | Macro |
+- **Physical Calibration:** `ADC_DRY_MV = 2553` (dry in air) and `ADC_WET_MV = 881` (submerged in water).
+- **Potting-Soil Rescale (`24% – 84%` physical → `0% – 100%` reported):** `SOIL_SCALE_MIN_RAW_PCT = 24.0f` and `SOIL_SCALE_MAX_RAW_PCT = 84.0f` stretch the usable citrus potting-soil range onto `0–100%` (`100%` = freshly watered peak, `~67–77%` = settled field capacity, **`10%` = watering point**, `0%` = bone-dry reserve floor).
+
+| Reported Soil Moisture | Tier | Deep-Sleep Interval | Macro |
 | :--- | :--- | :--- | :--- |
-| **`<= 35.0%`** | Dry | **`2 hours`** (`7,200 s`) | `SLEEP_SECS_DRY` |
-| **`35.0% – 40.0%`** | Mid | **`6 hours`** (`21,600 s`) | `SLEEP_SECS_MID` |
-| **`> 40.0%`** | Wet | **`12 hours`** (`43,200 s`) | `SLEEP_SECS_WET` |
+| **`> 80.0%`** | Drain (post-watering runoff) | **`2 hours`** (`7,200 s`) | `SLEEP_SECS_DRAIN` |
+| **`35.0% – 80.0%`** | Wet (settled & healthy) | **`12 hours`** (`43,200 s`) | `SLEEP_SECS_WET` |
+| **`20.0% – 35.0%`** | Mid (drying down) | **`6 hours`** (`21,600 s`) | `SLEEP_SECS_MID` |
+| **`<= 20.0%`** | Dry (approaching `10%` watering point) | **`2 hours`** (`7,200 s`) | `SLEEP_SECS_DRY` |
 | Sensor read error | Error | `30 minutes` (`1,800 s`) | `SLEEP_SECS_ERROR` |
 
 ### Dynamic Matter Report Completion & Self-Healing Retries

@@ -56,9 +56,9 @@ static_assert(sizeof(DEVICE_HARDWARE_VER_STR) - 1 <= 64, "HardwareVersionString 
 #define SENSOR_SETTLE_MS   250
 #define SENSOR_ADC_SAMPLES 16
 
-// Sensor calibration endpoints (12 dB ADC attenuation):
-// - Dry (0% moisture):   probe held dry in the air
-// - Wet (100% moisture): probe submerged in water
+// Physical probe calibration endpoints (12 dB ADC attenuation):
+// - Dry (0% physical):   probe held dry in the air
+// - Wet (100% physical): probe submerged in water
 // ADC_DRY_MV / ADC_WET_MV are factory eFuse-calibrated millivolt values portable
 // across ESP32-C6 boards; ADC_DRY_VAL / ADC_WET_VAL are the corresponding raw
 // 12-bit fallback counts (also used to derive mV on-chip if *_MV are set to 0).
@@ -66,6 +66,17 @@ static_assert(sizeof(DEVICE_HARDWARE_VER_STR) - 1 <= 64, "HardwareVersionString 
 #define ADC_WET_MV  881     // submerged in water (mV)
 #define ADC_DRY_VAL 2572.0f // dry in the air (raw 12-bit fallback)
 #define ADC_WET_VAL 886.0f  // submerged in water (raw 12-bit fallback)
+
+// Potting-soil rescale window (in physical air/water %):
+// Maps the usable citrus potting-mix range onto 0-100% so Home Assistant displays:
+// - 100% = 84% physical (~1149 mV, saturated peak right after watering)
+// - ~70% = 64-70% physical (settled field capacity 0.5-2 h after watering)
+// -  10% = 30% physical (~2051 mV, watering point for the Calamondin tree)
+// -   0% = 24% physical (~2152 mV, bone-dry reserve floor)
+#define SOIL_SCALE_MIN_RAW_PCT 24.0f
+#define SOIL_SCALE_MAX_RAW_PCT 84.0f
+static_assert(SOIL_SCALE_MAX_RAW_PCT > SOIL_SCALE_MIN_RAW_PCT,
+              "SOIL_SCALE_MAX_RAW_PCT must be greater than SOIL_SCALE_MIN_RAW_PCT");
 
 // ---------------------------------------------------------------------------
 // Sleep policy
@@ -76,20 +87,25 @@ static_assert(sizeof(DEVICE_HARDWARE_VER_STR) - 1 <= 64, "HardwareVersionString 
 #define TEST_SHORT_SLEEP 0
 #define SLEEP_SECS_TEST  (2 * 60)
 
-// Set to 1 for the 24-48h monitoring run (2h dry / 4h mid / 6h wet);
-// set to 0 for final production battery intervals (2h dry / 6h mid / 12h wet).
+// Set to 1 for the 24-48h monitoring run (2h drain / 6h wet / 4h mid / 2h dry);
+// set to 0 for final production battery intervals (2h drain / 12h wet / 6h mid / 2h dry).
 #define MONITORING_MAX_6H 0
 
-// Wake interval as a function of measured moisture. Wetter soil changes slowly,
-// so it is checked less often.
+// Wake interval as a function of rescaled soil moisture (%):
+// - > 80%:     2 h  (freshly watered runoff settling down to ~67-77% field capacity)
+// - 35% - 80%: 12 h (healthy settled moisture; matches Matter ICD 43,200 s idle ceiling)
+// - 20% - 35%: 6 h  (drying down toward watering day)
+// - <= 20%:    2 h  (approaching/at 10% watering point; also detects watering promptly)
 #if MONITORING_MAX_6H
-#define SLEEP_SECS_WET   (6 * 60 * 60)    // moisture > 40%  || 6 hours (monitoring cap)
-#define SLEEP_SECS_MID   (4 * 60 * 60)    // moisture > 35%  || 4 hours (monitoring tier)
-#define SLEEP_SECS_DRY   (2 * 60 * 60)    // moisture <= 35% || 2 hours
+#define SLEEP_SECS_DRAIN (2 * 60 * 60)    // moisture > 80%        || 2 hours
+#define SLEEP_SECS_WET   (6 * 60 * 60)    // 35% < moisture <= 80% || 6 hours (monitoring cap)
+#define SLEEP_SECS_MID   (4 * 60 * 60)    // 20% < moisture <= 35% || 4 hours (monitoring tier)
+#define SLEEP_SECS_DRY   (2 * 60 * 60)    // moisture <= 20%       || 2 hours
 #else
-#define SLEEP_SECS_WET   (12 * 60 * 60)   // moisture > 40%  || 12 hours
-#define SLEEP_SECS_MID   (6 * 60 * 60)    // moisture > 35%  || 6 hours
-#define SLEEP_SECS_DRY   (2 * 60 * 60)    // moisture <= 35% || 2 hours
+#define SLEEP_SECS_DRAIN (2 * 60 * 60)    // moisture > 80%        || 2 hours
+#define SLEEP_SECS_WET   (12 * 60 * 60)   // 35% < moisture <= 80% || 12 hours
+#define SLEEP_SECS_MID   (6 * 60 * 60)    // 20% < moisture <= 35% || 6 hours
+#define SLEEP_SECS_DRY   (2 * 60 * 60)    // moisture <= 20%       || 2 hours
 #endif
 #define SLEEP_SECS_ERROR (30 * 60)        // sensor read failed
 
@@ -137,6 +153,7 @@ static adc_cali_handle_t adc1_cali_handle = NULL;
 static int s_cal_dry_mv = 0;
 static int s_cal_wet_mv = 0;
 static float initial_moisture_percent = -1.0f;
+static float initial_physical_percent = -1.0f;
 static int initial_adc_raw = 0;
 static int initial_adc_mv = -1;
 static volatile bool s_commissioning_complete = false;
@@ -319,7 +336,19 @@ static void app_event_cb(const chip::DeviceLayer::ChipDeviceEvent *event, intptr
 // Sensor
 // ---------------------------------------------------------------------------
 
-static float read_moisture_percent(int *raw_out, int *mv_out)
+static float physical_to_soil_percent(float physical_percent)
+{
+    if (physical_percent <= SOIL_SCALE_MIN_RAW_PCT) {
+        return 0.0f;
+    }
+    if (physical_percent >= SOIL_SCALE_MAX_RAW_PCT) {
+        return 100.0f;
+    }
+    return 100.0f * (physical_percent - SOIL_SCALE_MIN_RAW_PCT) /
+           (SOIL_SCALE_MAX_RAW_PCT - SOIL_SCALE_MIN_RAW_PCT);
+}
+
+static float read_moisture_percent(int *raw_out, int *mv_out, float *physical_pct_out)
 {
     // Power up with full GPIO drive strength, let the sensor's onboard LDO,
     // 555 oscillator, and RC filter settle, multisample, then power down.
@@ -363,6 +392,9 @@ static float read_moisture_percent(int *raw_out, int *mv_out)
         if (mv_out) {
             *mv_out = -1;
         }
+        if (physical_pct_out) {
+            *physical_pct_out = -1.0f;
+        }
         ESP_LOGE(TAG, "ADC read failed: %s", esp_err_to_name(last_err));
         return -1.0f;
     }
@@ -372,6 +404,7 @@ static float read_moisture_percent(int *raw_out, int *mv_out)
         *raw_out = adc_raw;
     }
 
+    float physical_pct = 0.0f;
     if (valid_mv_samples > 0 && s_cal_dry_mv > s_cal_wet_mv) {
         int adc_mv = static_cast<int>((mv_sum + (valid_mv_samples / 2)) / valid_mv_samples);
         if (mv_out) {
@@ -379,13 +412,17 @@ static float read_moisture_percent(int *raw_out, int *mv_out)
         }
         // Capacitive sensors read HIGH voltage when dry, LOW voltage when wet.
         if (adc_mv >= s_cal_dry_mv) {
-            return 0.0f;
+            physical_pct = 0.0f;
+        } else if (adc_mv <= s_cal_wet_mv) {
+            physical_pct = 100.0f;
+        } else {
+            physical_pct = 100.0f * static_cast<float>(s_cal_dry_mv - adc_mv) /
+                           static_cast<float>(s_cal_dry_mv - s_cal_wet_mv);
         }
-        if (adc_mv <= s_cal_wet_mv) {
-            return 100.0f;
+        if (physical_pct_out) {
+            *physical_pct_out = physical_pct;
         }
-        return 100.0f * static_cast<float>(s_cal_dry_mv - adc_mv) /
-               static_cast<float>(s_cal_dry_mv - s_cal_wet_mv);
+        return physical_to_soil_percent(physical_pct);
     }
 
     if (mv_out) {
@@ -395,12 +432,16 @@ static float read_moisture_percent(int *raw_out, int *mv_out)
     // Fallback to raw counts if factory eFuse calibration is unavailable.
     // Capacitive sensors read HIGH when dry, LOW when wet, so the mapping is inverted.
     if (adc_raw >= (int)ADC_DRY_VAL) {
-        return 0.0f;
+        physical_pct = 0.0f;
+    } else if (adc_raw <= (int)ADC_WET_VAL) {
+        physical_pct = 100.0f;
+    } else {
+        physical_pct = 100.0f * (ADC_DRY_VAL - (float)adc_raw) / (ADC_DRY_VAL - ADC_WET_VAL);
     }
-    if (adc_raw <= (int)ADC_WET_VAL) {
-        return 100.0f;
+    if (physical_pct_out) {
+        *physical_pct_out = physical_pct;
     }
-    return 100.0f * (ADC_DRY_VAL - (float)adc_raw) / (ADC_DRY_VAL - ADC_WET_VAL);
+    return physical_to_soil_percent(physical_pct);
 }
 
 // ---------------------------------------------------------------------------
@@ -575,10 +616,13 @@ static uint32_t sleep_seconds_for(float moisture_percent)
     if (moisture_percent < 0.0f) {
         return SLEEP_SECS_ERROR;
     }
-    if (moisture_percent > 40.0f) {
-        return SLEEP_SECS_WET;
+    if (moisture_percent > 80.0f) {
+        return SLEEP_SECS_DRAIN;
     }
     if (moisture_percent > 35.0f) {
+        return SLEEP_SECS_WET;
+    }
+    if (moisture_percent > 20.0f) {
         return SLEEP_SECS_MID;
     }
     return SLEEP_SECS_DRY;
@@ -634,13 +678,16 @@ static void measure_and_sleep_task(void *pvParameters)
 {
     int adc_raw = initial_adc_raw;
     int adc_mv = initial_adc_mv;
+    float physical_percent = initial_physical_percent;
     float moisture_percent = initial_moisture_percent;
     if (adc_mv >= 0) {
-        ESP_LOGI(TAG, "Wake #%" PRIu32 " - Raw ADC: %d (%d mV), Moisture: %.1f%%",
-                 wake_count, adc_raw, adc_mv, moisture_percent);
+        ESP_LOGI(TAG,
+                 "Wake #%" PRIu32 " - Raw ADC: %d (%d mV, air/water %.1f%%), Soil Moisture: %.1f%%",
+                 wake_count, adc_raw, adc_mv, physical_percent, moisture_percent);
     } else {
-        ESP_LOGI(TAG, "Wake #%" PRIu32 " - Raw ADC: %d, Moisture: %.1f%%",
-                 wake_count, adc_raw, moisture_percent);
+        ESP_LOGI(TAG,
+                 "Wake #%" PRIu32 " - Raw ADC: %d (air/water %.1f%%), Soil Moisture: %.1f%%",
+                 wake_count, adc_raw, physical_percent, moisture_percent);
     }
 
     if (is_commissioned()) {
@@ -670,13 +717,15 @@ static void measure_and_sleep_task(void *pvParameters)
             ESP_LOGI(TAG, "Now commissioned - entering sleep cycle");
 
             // The reading above was taken before pairing and may be old by now.
-            moisture_percent = read_moisture_percent(&adc_raw, &adc_mv);
+            moisture_percent = read_moisture_percent(&adc_raw, &adc_mv, &physical_percent);
             if (adc_mv >= 0) {
-                ESP_LOGI(TAG, "Post-commissioning reading - Raw ADC: %d (%d mV), Moisture: %.1f%%",
-                         adc_raw, adc_mv, moisture_percent);
+                ESP_LOGI(TAG,
+                         "Post-commissioning reading - Raw ADC: %d (%d mV, air/water %.1f%%), Soil Moisture: %.1f%%",
+                         adc_raw, adc_mv, physical_percent, moisture_percent);
             } else {
-                ESP_LOGI(TAG, "Post-commissioning reading - Raw ADC: %d, Moisture: %.1f%%",
-                         adc_raw, moisture_percent);
+                ESP_LOGI(TAG,
+                         "Post-commissioning reading - Raw ADC: %d (air/water %.1f%%), Soil Moisture: %.1f%%",
+                         adc_raw, physical_percent, moisture_percent);
             }
         }
 
@@ -856,7 +905,8 @@ extern "C" void app_main(void)
 
     // Read the sensor before creating the Matter endpoint so MeasuredValue starts
     // with the actual moisture reading rather than 0% during subscription resumption.
-    initial_moisture_percent = read_moisture_percent(&initial_adc_raw, &initial_adc_mv);
+    initial_moisture_percent =
+        read_moisture_percent(&initial_adc_raw, &initial_adc_mv, &initial_physical_percent);
     uint16_t initial_centi = (initial_moisture_percent >= 0.0f)
                                  ? percent_to_centi(initial_moisture_percent)
                                  : 0;
