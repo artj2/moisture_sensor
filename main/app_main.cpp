@@ -348,6 +348,29 @@ static float physical_to_soil_percent(float physical_percent)
            (SOIL_SCALE_MAX_RAW_PCT - SOIL_SCALE_MIN_RAW_PCT);
 }
 
+static int interquartile_mean(int *samples, int count)
+{
+    for (int i = 1; i < count; i++) {
+        int v = samples[i];
+        int j = i - 1;
+        while (j >= 0 && samples[j] > v) {
+            samples[j + 1] = samples[j];
+            j--;
+        }
+        samples[j + 1] = v;
+    }
+
+    // Discard lowest 25% and highest 25% (for 16 samples, average the middle 8)
+    // to reject single-sample ADC or 555-timer edge spikes.
+    int trim = count / 4;
+    int kept = count - (2 * trim);
+    int64_t sum = 0;
+    for (int i = trim; i < count - trim; i++) {
+        sum += samples[i];
+    }
+    return static_cast<int>((sum + (kept / 2)) / kept);
+}
+
 static float read_moisture_percent(int *raw_out, int *mv_out, float *physical_pct_out)
 {
     // Power up with full GPIO drive strength, let the sensor's onboard LDO,
@@ -359,8 +382,8 @@ static float read_moisture_percent(int *raw_out, int *mv_out, float *physical_pc
     int dummy = 0;
     (void)adc_oneshot_read(adc1_handle, SENSOR_ADC_CHAN, &dummy);
 
-    int64_t raw_sum = 0;
-    int64_t mv_sum = 0;
+    int raw_samples[SENSOR_ADC_SAMPLES];
+    int mv_samples[SENSOR_ADC_SAMPLES];
     int valid_samples = 0;
     int valid_mv_samples = 0;
     esp_err_t last_err = ESP_OK;
@@ -368,13 +391,11 @@ static float read_moisture_percent(int *raw_out, int *mv_out, float *physical_pc
         int sample = 0;
         esp_err_t err = adc_oneshot_read(adc1_handle, SENSOR_ADC_CHAN, &sample);
         if (err == ESP_OK) {
-            raw_sum += sample;
-            valid_samples++;
+            raw_samples[valid_samples++] = sample;
             if (adc1_cali_handle != NULL) {
                 int sample_mv = 0;
                 if (adc_cali_raw_to_voltage(adc1_cali_handle, sample, &sample_mv) == ESP_OK) {
-                    mv_sum += sample_mv;
-                    valid_mv_samples++;
+                    mv_samples[valid_mv_samples++] = sample_mv;
                 }
             }
         } else {
@@ -399,14 +420,14 @@ static float read_moisture_percent(int *raw_out, int *mv_out, float *physical_pc
         return -1.0f;
     }
 
-    int adc_raw = static_cast<int>((raw_sum + (valid_samples / 2)) / valid_samples);
+    int adc_raw = interquartile_mean(raw_samples, valid_samples);
     if (raw_out) {
         *raw_out = adc_raw;
     }
 
     float physical_pct = 0.0f;
     if (valid_mv_samples > 0 && s_cal_dry_mv > s_cal_wet_mv) {
-        int adc_mv = static_cast<int>((mv_sum + (valid_mv_samples / 2)) / valid_mv_samples);
+        int adc_mv = interquartile_mean(mv_samples, valid_mv_samples);
         if (mv_out) {
             *mv_out = adc_mv;
         }
