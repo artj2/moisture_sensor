@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#include <sys/time.h>
+#include "esp_sntp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -92,18 +95,15 @@ static_assert(SOIL_SCALE_MAX_RAW_PCT > SOIL_SCALE_MIN_RAW_PCT,
 #define MONITORING_MAX_6H 0
 
 // Wake interval as a function of rescaled soil moisture (%):
-// - > 80%:     2 h  (freshly watered runoff settling down to ~67-77% field capacity)
-// - 35% - 80%: 12 h (healthy settled moisture; matches Matter ICD 43,200 s idle ceiling)
+// - > 35%:     12 h (healthy wet / settled moisture; matches Matter ICD 43,200 s idle ceiling)
 // - 20% - 35%: 6 h  (drying down toward watering day)
 // - <= 20%:    2 h  (approaching/at 10% watering point; also detects watering promptly)
 #if MONITORING_MAX_6H
-#define SLEEP_SECS_DRAIN (2 * 60 * 60)    // moisture > 80%        || 2 hours
-#define SLEEP_SECS_WET   (6 * 60 * 60)    // 35% < moisture <= 80% || 6 hours (monitoring cap)
+#define SLEEP_SECS_WET   (6 * 60 * 60)    // moisture > 35%        || 6 hours (monitoring cap)
 #define SLEEP_SECS_MID   (4 * 60 * 60)    // 20% < moisture <= 35% || 4 hours (monitoring tier)
 #define SLEEP_SECS_DRY   (2 * 60 * 60)    // moisture <= 20%       || 2 hours
 #else
-#define SLEEP_SECS_DRAIN (2 * 60 * 60)    // moisture > 80%        || 2 hours
-#define SLEEP_SECS_WET   (12 * 60 * 60)   // 35% < moisture <= 80% || 12 hours
+#define SLEEP_SECS_WET   (12 * 60 * 60)   // moisture > 35%        || 12 hours
 #define SLEEP_SECS_MID   (6 * 60 * 60)    // 20% < moisture <= 35% || 6 hours
 #define SLEEP_SECS_DRY   (2 * 60 * 60)    // moisture <= 20%       || 2 hours
 #endif
@@ -161,6 +161,9 @@ static volatile bool s_commissioning_complete = false;
 // Survives deep sleep; cleared on power-on and hard reset.
 RTC_DATA_ATTR static uint32_t wake_count = 0;
 RTC_DATA_ATTR static uint32_t consecutive_failures = 0;
+RTC_DATA_ATTR static time_t s_last_sleep_utc = 0;
+RTC_DATA_ATTR static uint32_t s_last_sleep_timer = 0;
+RTC_DATA_ATTR static float s_rtc_scale = 1.0164f; // Nominal baseline: internal RC oscillator runs ~1.64% fast
 
 // RAII wrapper around the CHIP stack lock.
 // esp_matter::lock::chip_stack_lock() is not usable in esp-matter 1.6 (the
@@ -625,8 +628,81 @@ static bool wait_for_matter_report_complete(bool just_commissioned)
 }
 
 // ---------------------------------------------------------------------------
-// Sleep
+// Sleep & Time Synchronization
 // ---------------------------------------------------------------------------
+
+static void sntp_sync_init(void)
+{
+    if (esp_sntp_enabled()) {
+        return;
+    }
+    ESP_LOGI(TAG, "Starting SNTP time synchronization over Thread...");
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.google.com");
+    esp_sntp_setservername(2, "2001:4860:4806::"); // Google public IPv6 (works without DNS)
+    esp_sntp_init();
+}
+
+static void sntp_sync_stop(void)
+{
+    if (esp_sntp_enabled()) {
+        esp_sntp_stop();
+    }
+}
+
+static void log_and_calibrate_clock(void)
+{
+    time_t now = time(NULL);
+    if (now > 1700000000) { // Valid timestamp (> Nov 2023)
+        struct tm tm_info;
+        gmtime_r(&now, &tm_info);
+        char buf[64];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &tm_info);
+        ESP_LOGI(TAG, "Current real-world time: %s", buf);
+
+        if (s_last_sleep_utc > 0 && s_last_sleep_timer > 0 && now > s_last_sleep_utc) {
+            uint32_t real_elapsed = static_cast<uint32_t>(now - s_last_sleep_utc);
+            float measured_scale = static_cast<float>(s_last_sleep_timer) / static_cast<float>(real_elapsed);
+            if (measured_scale >= 0.92f && measured_scale <= 1.10f) {
+                s_rtc_scale = (0.80f * s_rtc_scale) + (0.20f * measured_scale);
+                ESP_LOGI(TAG,
+                         "RTC drift calibration: prev requested=%" PRIu32 " s, elapsed=%" PRIu32
+                         " s, measured=%.4f, smoothed=%.4f",
+                         s_last_sleep_timer, real_elapsed, measured_scale, s_rtc_scale);
+            }
+        }
+    } else {
+        ESP_LOGW(TAG, "Real-world time not yet synchronized (POSIX epoch %ld)", static_cast<long>(now));
+    }
+}
+
+static uint32_t calculate_aligned_sleep_seconds(uint32_t interval_seconds)
+{
+    time_t now = time(NULL);
+    if (now < 1700000000 || interval_seconds == 0) {
+        ESP_LOGW(TAG, "System time not synchronized; using nominal %" PRIu32 " s sleep", interval_seconds);
+        return interval_seconds;
+    }
+
+    time_t target = ((now / interval_seconds) + 1) * interval_seconds;
+    if ((target - now) < 120) {
+        target += interval_seconds;
+    }
+
+    uint32_t nominal_seconds = static_cast<uint32_t>(target - now);
+    uint32_t timer_seconds = static_cast<uint32_t>(lroundf(nominal_seconds * s_rtc_scale));
+
+    struct tm tm_target;
+    gmtime_r(&target, &tm_target);
+    char target_str[32];
+    strftime(target_str, sizeof(target_str), "%H:%M:%S UTC", &tm_target);
+
+    ESP_LOGI(TAG, "Top-of-hour alignment: target %s (nominal %" PRIu32 " s, timer %" PRIu32 " s, scale=%.4f)",
+             target_str, nominal_seconds, timer_seconds, s_rtc_scale);
+
+    return timer_seconds;
+}
 
 static uint32_t sleep_seconds_for(float moisture_percent)
 {
@@ -636,9 +712,6 @@ static uint32_t sleep_seconds_for(float moisture_percent)
 #else
     if (moisture_percent < 0.0f) {
         return SLEEP_SECS_ERROR;
-    }
-    if (moisture_percent > 80.0f) {
-        return SLEEP_SECS_DRAIN;
     }
     if (moisture_percent > 35.0f) {
         return SLEEP_SECS_WET;
@@ -665,6 +738,12 @@ static void wait_if_boot_button_pressed(void)
 static void enter_deep_sleep(uint32_t seconds)
 {
     wait_if_boot_button_pressed();
+
+    time_t now = time(NULL);
+    if (now > 1700000000) {
+        s_last_sleep_utc = now;
+        s_last_sleep_timer = seconds;
+    }
 
     ESP_LOGI(TAG, "Sleeping for %" PRIu32 " s", seconds);
 
@@ -697,6 +776,8 @@ static void enter_deep_sleep(uint32_t seconds)
 
 static void measure_and_sleep_task(void *pvParameters)
 {
+    log_and_calibrate_clock();
+
     int adc_raw = initial_adc_raw;
     int adc_mv = initial_adc_mv;
     float physical_percent = initial_physical_percent;
@@ -754,11 +835,13 @@ static void measure_and_sleep_task(void *pvParameters)
 
         bool published = false;
         if (wait_for_thread_attached(THREAD_ATTACH_TIMEOUT_MS) && moisture_percent >= 0.0f) {
+            sntp_sync_init();
             uint16_t matter_humidity = percent_to_centi(moisture_percent);
             if (publish_humidity(matter_humidity) == ESP_OK) {
                 published = wait_for_matter_report_complete(just_commissioned);
             }
         }
+        sntp_sync_stop();
 
         // If the fabric was removed while we were awake, stay awake for re-pairing.
         if (!is_commissioned()) {
@@ -769,21 +852,23 @@ static void measure_and_sleep_task(void *pvParameters)
         uint32_t sleep_secs;
         if (published) {
             consecutive_failures = 0;
-            sleep_secs = sleep_seconds_for(moisture_percent);
+            uint32_t nominal_tier = sleep_seconds_for(moisture_percent);
+            sleep_secs = calculate_aligned_sleep_seconds(nominal_tier);
         } else {
 #if TEST_SHORT_SLEEP
             consecutive_failures++;
-            sleep_secs = SLEEP_SECS_TEST;
+            sleep_secs = calculate_aligned_sleep_seconds(SLEEP_SECS_TEST);
             ESP_LOGW(TAG, "Reading not published (failure #%" PRIu32 ") - retrying in %" PRIu32 " s (test mode)",
                      consecutive_failures, sleep_secs);
 #else
             // Exponential backoff, capped. 30 min, 1 h, 2 h, 4 h, 6 h, 6 h...
             uint32_t shift = consecutive_failures < 4 ? consecutive_failures : 4;
-            sleep_secs = SLEEP_SECS_RETRY << shift;
-            if (sleep_secs > SLEEP_SECS_RETRY_MAX) {
-                sleep_secs = SLEEP_SECS_RETRY_MAX;
+            uint32_t nominal_retry = SLEEP_SECS_RETRY << shift;
+            if (nominal_retry > SLEEP_SECS_RETRY_MAX) {
+                nominal_retry = SLEEP_SECS_RETRY_MAX;
             }
             consecutive_failures++;
+            sleep_secs = calculate_aligned_sleep_seconds(nominal_retry);
             ESP_LOGW(TAG, "Reading not published (failure #%" PRIu32 ") - retrying in %" PRIu32 " s",
                      consecutive_failures, sleep_secs);
 #endif
