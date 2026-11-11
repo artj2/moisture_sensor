@@ -638,9 +638,10 @@ static void sntp_sync_init(void)
     }
     ESP_LOGI(TAG, "Starting SNTP time synchronization over Thread...");
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
-    esp_sntp_setservername(1, "time.google.com");
-    esp_sntp_setservername(2, "2001:4860:4806::"); // Google public IPv6 (works without DNS)
+    // Literal IPv6 addresses first: bypasses DNS, immediate UDP dispatch on Thread
+    esp_sntp_setservername(0, "2001:4860:4806::"); // Google Public NTP IPv6
+    esp_sntp_setservername(1, "2606:4700:f1::1");  // Cloudflare Public NTP IPv6
+    esp_sntp_setservername(2, "pool.ntp.org");     // Global pool fallback (via DNS)
     esp_sntp_init();
 }
 
