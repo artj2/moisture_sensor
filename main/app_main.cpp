@@ -705,7 +705,14 @@ static uint32_t calculate_aligned_sleep_seconds(uint32_t interval_seconds)
     }
 
     time_t target = ((now / interval_seconds) + 1) * interval_seconds;
-    if ((target - now) < 120) {
+    // Prevent redundant wakeups if waking slightly early due to hardware clock drift:
+    // If waking within 30 minutes before the target boundary (or within 25% for shorter tiers),
+    // treat this check-in as already satisfying the slot and sleep through to the next boundary.
+    uint32_t early_tolerance_s = 1800; // 30 minutes
+    if (interval_seconds < 7200) {
+        early_tolerance_s = interval_seconds / 4;
+    }
+    if (static_cast<uint32_t>(target - now) < early_tolerance_s) {
         target += interval_seconds;
     }
 
