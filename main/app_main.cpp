@@ -631,6 +631,16 @@ static bool wait_for_matter_report_complete(bool just_commissioned)
 // Sleep & Time Synchronization
 // ---------------------------------------------------------------------------
 
+static void time_sync_notification_cb(struct timeval *tv)
+{
+    time_t sec = tv->tv_sec;
+    struct tm tm_info;
+    gmtime_r(&sec, &tm_info);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &tm_info);
+    ESP_LOGI(TAG, "SNTP time synchronization event: %s", buf);
+}
+
 static void sntp_sync_init(void)
 {
     if (esp_sntp_enabled()) {
@@ -638,10 +648,9 @@ static void sntp_sync_init(void)
     }
     ESP_LOGI(TAG, "Starting SNTP time synchronization over Thread...");
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    // Literal IPv6 addresses first: bypasses DNS, immediate UDP dispatch on Thread
-    esp_sntp_setservername(0, "2001:4860:4806::"); // Google Public NTP IPv6
-    esp_sntp_setservername(1, "2606:4700:f1::1");  // Cloudflare Public NTP IPv6
-    esp_sntp_setservername(2, "pool.ntp.org");     // Global pool fallback (via DNS)
+    // Home Assistant Thread NTP server (Chrony on local Thread mesh)
+    esp_sntp_setservername(0, "fdea:6164:84c:1:8daf:5cbf:b421:c513");
+    sntp_set_time_sync_notification_cb(time_sync_notification_cb);
     esp_sntp_init();
 }
 
@@ -672,6 +681,8 @@ static void log_and_calibrate_clock(void)
                          " s, measured=%.4f, smoothed=%.4f",
                          s_last_sleep_timer, real_elapsed, measured_scale, s_rtc_scale);
             }
+            s_last_sleep_utc = 0;
+            s_last_sleep_timer = 0;
         }
     } else {
         ESP_LOGW(TAG, "Real-world time not yet synchronized (POSIX epoch %ld)", static_cast<long>(now));
@@ -843,6 +854,7 @@ static void measure_and_sleep_task(void *pvParameters)
             }
         }
         sntp_sync_stop();
+        log_and_calibrate_clock();
 
         // If the fabric was removed while we were awake, stay awake for re-pairing.
         if (!is_commissioned()) {
