@@ -17,6 +17,8 @@
 #include "esp_openthread.h"
 #include "esp_openthread_lock.h"
 #include "esp_openthread_types.h"
+#include "esp_openthread_netif_glue.h"
+#include "esp_netif.h"
 #include <openthread/dataset.h>
 #include <platform/ESP32/OpenthreadLauncher.h>
 #include "esp_matter.h"
@@ -645,6 +647,11 @@ static void sntp_sync_init(void)
 {
     if (esp_sntp_enabled()) {
         return;
+    }
+    // Bind OpenThread netif as default netif so lwIP routes UDP/SNTP packets over Thread
+    esp_netif_t *ot_netif = esp_openthread_get_netif();
+    if (ot_netif) {
+        esp_netif_set_default_netif(ot_netif);
     }
     ESP_LOGI(TAG, "Starting SNTP time synchronization over Thread...");
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
