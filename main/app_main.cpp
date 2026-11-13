@@ -4,6 +4,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include "esp_sntp.h"
+#include "lwip/ip_addr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -135,6 +136,11 @@ static_assert(SOIL_SCALE_MAX_RAW_PCT > SOIL_SCALE_MIN_RAW_PCT,
 #define REPORT_MAX_WAIT_MS   60000
 #define REPORT_QUIET_MS      1500
 
+// Home Assistant local Thread mesh NTP server (Chrony).
+// Thread Sleepy End Devices cannot reach public IPv4 NTP or rely on public DNS;
+// update this to your Home Assistant host's Thread Unique Local Address (ULA).
+#define HA_NTP_SERVER_ULA "fdea:6164:84c:1:8daf:5cbf:b421:c513"
+
 // Longer grace period for the first cycle after commissioning. The controller
 // walks the descriptor tree, registers ICD Check-In, and sets up subscriptions
 // immediately after pairing; sleeping through that leaves Home Assistant with
@@ -165,7 +171,8 @@ RTC_DATA_ATTR static uint32_t wake_count = 0;
 RTC_DATA_ATTR static uint32_t consecutive_failures = 0;
 RTC_DATA_ATTR static time_t s_last_sleep_utc = 0;
 RTC_DATA_ATTR static uint32_t s_last_sleep_timer = 0;
-RTC_DATA_ATTR static float s_rtc_scale = 1.0164f; // Nominal baseline: internal RC oscillator runs ~1.64% fast
+RTC_DATA_ATTR static float s_rtc_scale = 1.0129f; // Empirical baseline: internal RC oscillator runs ~1.29% fast
+static volatile bool s_sntp_synced = false;
 
 // RAII wrapper around the CHIP stack lock.
 // esp_matter::lock::chip_stack_lock() is not usable in esp-matter 1.6 (the
@@ -641,6 +648,7 @@ static void time_sync_notification_cb(struct timeval *tv)
     char buf[64];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &tm_info);
     ESP_LOGI(TAG, "SNTP time synchronization event: %s", buf);
+    s_sntp_synced = true;
 }
 
 static void sntp_sync_init(void)
@@ -655,8 +663,11 @@ static void sntp_sync_init(void)
     }
     ESP_LOGI(TAG, "Starting SNTP time synchronization over Thread...");
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    // Home Assistant Thread NTP server (Chrony on local Thread mesh)
-    esp_sntp_setservername(0, "fdea:6164:84c:1:8daf:5cbf:b421:c513");
+    // Home Assistant Thread NTP server (Chrony on local Thread mesh, literal IP avoids DNS layer)
+    ip_addr_t ntp_addr;
+    if (ipaddr_aton(HA_NTP_SERVER_ULA, &ntp_addr)) {
+        esp_sntp_setserver(0, &ntp_addr);
+    }
     sntp_set_time_sync_notification_cb(time_sync_notification_cb);
     esp_sntp_init();
 }
@@ -678,7 +689,7 @@ static void log_and_calibrate_clock(void)
         strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &tm_info);
         ESP_LOGI(TAG, "Current real-world time: %s", buf);
 
-        if (s_last_sleep_utc > 0 && s_last_sleep_timer > 0 && now > s_last_sleep_utc) {
+        if (s_sntp_synced && s_last_sleep_utc > 0 && s_last_sleep_timer > 0 && now > s_last_sleep_utc) {
             uint32_t real_elapsed = static_cast<uint32_t>(now - s_last_sleep_utc);
             float measured_scale = static_cast<float>(s_last_sleep_timer) / static_cast<float>(real_elapsed);
             if (measured_scale >= 0.92f && measured_scale <= 1.10f) {
@@ -865,6 +876,18 @@ static void measure_and_sleep_task(void *pvParameters)
             uint16_t matter_humidity = percent_to_centi(moisture_percent);
             if (publish_humidity(matter_humidity) == ESP_OK) {
                 published = wait_for_matter_report_complete(just_commissioned);
+            }
+        }
+
+        // If Matter reports finished before SNTP completed, trigger immediate retry in the quiet window
+        if (published && !s_sntp_synced) {
+            ESP_LOGI(TAG, "Matter complete; triggering SNTP sync in quiet radio window...");
+            esp_sntp_restart();
+            const uint32_t max_sntp_wait_ms = 1000;
+            uint32_t sntp_waited_ms = 0;
+            while (!s_sntp_synced && sntp_waited_ms < max_sntp_wait_ms) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                sntp_waited_ms += 50;
             }
         }
         sntp_sync_stop();

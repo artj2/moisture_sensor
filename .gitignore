@@ -6,3 +6,5 @@ sdkconfig.*
 !sdkconfig.defaults
 TODO.md
 GEMINI.md
+docs/
+

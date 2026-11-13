@@ -44,6 +44,35 @@ Configured in [`main/app_main.cpp`](main/app_main.cpp):
 
 ---
 
+## Time Synchronization & Top-of-Hour Alignment
+
+The sensor synchronizes real-world UTC time over Thread via SNTP to align its deep-sleep schedule with the top of the hour (e.g. waking at `00:00`, `06:00`, `12:00`, `18:00 UTC`) and calibrate hardware RC oscillator drift across varying ambient temperatures.
+
+### Setting Home Assistant's Thread Mesh ULA
+
+> [!IMPORTANT]
+> **Configuration Required Before Building:**
+> Because the sensor is an isolated Thread Sleepy End Device (SED), it cannot query public IPv4 NTP servers or resolve standard public DNS names. It queries Chrony running locally on your Home Assistant host over the Thread mesh.
+>
+> You **must** configure your Home Assistant host's Thread Unique Local Address (ULA) in [`main/app_main.cpp`](main/app_main.cpp):
+> ```cpp
+> #define HA_NTP_SERVER_ULA "fdea:6164:84c:1:8daf:5cbf:b421:c513"
+> ```
+
+#### How to Find Your Home Assistant Thread ULA
+1. In Home Assistant, open the **Terminal & SSH** add-on (or log into the host console) and run:
+   ```bash
+   ip -6 addr show
+   ```
+   Look for the `fd...` address with `/64` scope global on your host network interface (matching your Thread Border Router's mesh prefix).
+2. Alternatively, in Home Assistant go to **Settings → System → Network → Network Adapter** and inspect the IPv6 addresses assigned to your host.
+3. Verify Chrony allows queries from the local Thread mesh prefix in `/etc/chrony/chrony.conf` (or in the Chrony add-on configuration):
+   ```text
+   allow fd00::/8
+   ```
+
+---
+
 ## Build & Flash
 
 ### 1. Build
