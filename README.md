@@ -136,7 +136,7 @@ If you want a countdown or expected next wake timestamp on your dashboard, creat
 
 ```jinja2
 {% set m = states('sensor.plant_soil_sensor_humidity') | float(0) %}
-{% set hours = 12 if m > 35 else (6 if m > 20 else 2) %}
+{% set hours = 12 if m > 20 else (6 if m > 12 else 2) %}
 {% set last = as_datetime(states.sensor.plant_soil_sensor_humidity.last_reported) %}
 {% set next_time = last + timedelta(hours=hours) %}
 {{ next_time.replace(minute=0, second=0, microsecond=0).isoformat() }}
@@ -151,9 +151,9 @@ If you want a countdown or expected next wake timestamp on your dashboard, creat
 
 | Reported Soil Moisture | Tier | Deep-Sleep Interval | Macro |
 | :--- | :--- | :--- | :--- |
-| **`> 35.0%`** | Wet (settled & healthy) | **`12 hours`** (`43,200 s`) | `SLEEP_SECS_WET` |
-| **`20.0% – 35.0%`** | Mid (drying down) | **`6 hours`** (`21,600 s`) | `SLEEP_SECS_MID` |
-| **`<= 20.0%`** | Dry (approaching watering point) | **`2 hours`** (`7,200 s`) | `SLEEP_SECS_DRY` |
+| **`> 20.0%`** | Wet (settled & early dry-down) | **`12 hours`** (`43,200 s`) | `SLEEP_SECS_WET` |
+| **`12.0% – 20.0%`** | Mid (approaching watering range) | **`6 hours`** (`21,600 s`) | `SLEEP_SECS_MID` |
+| **`<= 12.0%`** | Dry (near/at watering point) | **`2 hours`** (`7,200 s`) | `SLEEP_SECS_DRY` |
 | Sensor read error | Error | `30 minutes` (`1,800 s`) | `SLEEP_SECS_ERROR` |
 
 ### Dynamic Report Completion & Self-Healing Retries

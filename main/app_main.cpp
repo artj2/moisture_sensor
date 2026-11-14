@@ -98,17 +98,17 @@ static_assert(SOIL_SCALE_MAX_RAW_PCT > SOIL_SCALE_MIN_RAW_PCT,
 #define MONITORING_MAX_6H 0
 
 // Wake interval as a function of rescaled soil moisture (%):
-// - > 35%:     12 h (healthy wet / settled moisture; matches Matter ICD 43,200 s idle ceiling)
-// - 20% - 35%: 6 h  (drying down toward watering day)
-// - <= 20%:    2 h  (approaching/at 10% watering point; also detects watering promptly)
+// - > 20%:     12 h (healthy wet / early dry-down; matches Matter ICD 43,200 s idle ceiling)
+// - 12% - 20%: 6 h  (approaching dry-down phase toward watering day)
+// - <= 12%:    2 h  (near/at 10% watering point; also detects watering promptly)
 #if MONITORING_MAX_6H
-#define SLEEP_SECS_WET   (6 * 60 * 60)    // moisture > 35%        || 6 hours (monitoring cap)
-#define SLEEP_SECS_MID   (4 * 60 * 60)    // 20% < moisture <= 35% || 4 hours (monitoring tier)
-#define SLEEP_SECS_DRY   (2 * 60 * 60)    // moisture <= 20%       || 2 hours
+#define SLEEP_SECS_WET   (6 * 60 * 60)    // moisture > 20%        || 6 hours (monitoring cap)
+#define SLEEP_SECS_MID   (4 * 60 * 60)    // 12% < moisture <= 20% || 4 hours (monitoring tier)
+#define SLEEP_SECS_DRY   (2 * 60 * 60)    // moisture <= 12%       || 2 hours
 #else
-#define SLEEP_SECS_WET   (12 * 60 * 60)   // moisture > 35%        || 12 hours
-#define SLEEP_SECS_MID   (6 * 60 * 60)    // 20% < moisture <= 35% || 6 hours
-#define SLEEP_SECS_DRY   (2 * 60 * 60)    // moisture <= 20%       || 2 hours
+#define SLEEP_SECS_WET   (12 * 60 * 60)   // moisture > 20%        || 12 hours
+#define SLEEP_SECS_MID   (6 * 60 * 60)    // 12% < moisture <= 20% || 6 hours
+#define SLEEP_SECS_DRY   (2 * 60 * 60)    // moisture <= 12%       || 2 hours
 #endif
 #define SLEEP_SECS_ERROR (30 * 60)        // sensor read failed
 
@@ -750,10 +750,10 @@ static uint32_t sleep_seconds_for(float moisture_percent)
     if (moisture_percent < 0.0f) {
         return SLEEP_SECS_ERROR;
     }
-    if (moisture_percent > 35.0f) {
+    if (moisture_percent > 20.0f) {
         return SLEEP_SECS_WET;
     }
-    if (moisture_percent > 20.0f) {
+    if (moisture_percent > 12.0f) {
         return SLEEP_SECS_MID;
     }
     return SLEEP_SECS_DRY;
